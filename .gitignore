@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Node
+node_modules/
+dist/
+
+# Local map files
+backend/data/
+# Local data and generated map artifacts
+backend/data/
+**/__pycache__/
+**/.venv/
+frontend/node_modules/
+frontend/dist/
+.env
+.env.*
+!.env.example
+.DS_Store
