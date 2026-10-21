@@ -4,6 +4,7 @@ import io, json, os, re, uuid, time, resource, hashlib
 import logging
 import sys
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from typing import Literal
@@ -30,6 +31,7 @@ ALLOWED_SUFFIXES={'.png','.jpg','.jpeg','.tif','.tiff','.bmp','.webp'}
 app=FastAPI(title='Survey Map Studio API',version='0.2.0')
 app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:5173','http://127.0.0.1:5173'],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
 lock=Lock(); assets:dict[str,dict]={}; jobs:dict[str,dict]={}; projects:dict[str,dict]={}; manual_locks:dict[str,Lock]={}
+OCR_EXECUTOR=ThreadPoolExecutor(max_workers=2,thread_name_prefix='survey-ocr')
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def _atomic_json(path:Path,data):
     temporary=path.with_suffix(path.suffix+'.tmp'); temporary.write_text(json.dumps(data)); temporary.replace(path)
@@ -174,7 +176,8 @@ def apply_removal_mask(rgb:np.ndarray, mask:np.ndarray, *, dilation:int=2, prote
     if protected is not None: result[protected>0]=rgb[protected>0]
     return result
 
-def build_principal_label_mask(shape, detections:list[dict], merged_labels:list[dict], padding:int=2)->np.ndarray:
+def build_principal_label_mask(shape, detections:list[dict], merged_labels:list[dict], padding:int=2,
+                               rgb:np.ndarray|None=None, competing_boxes:list[dict]|None=None)->np.ndarray:
     """Protect OCR-confirmed standalone integer labels and integers paired with decimals.
 
     Integer content is deliberately preserved regardless of its value. A measurement
@@ -188,7 +191,37 @@ def build_principal_label_mask(shape, detections:list[dict], merged_labels:list[
         x,y,w,h=[int(box.get(k,0)) for k in ('x','y','width','height')]
         if w<=0 or h<=0: continue
         x0=max(0,x-padding); y0=max(0,y-padding); x1=min(width,x+w+padding); y1=min(height,y+h+padding)
-        if x1>x0 and y1>y0: cv2.rectangle(protected,(x0,y0),(x1-1,y1-1),255,-1)
+        if x1<=x0 or y1<=y0: continue
+        if rgb is None:
+            # Keep the legacy behavior for callers without source pixels.
+            cv2.rectangle(protected,(x0,y0),(x1-1,y1-1),255,-1)
+            continue
+        if rgb.shape[:2] != (height,width): raise ValueError('Label image and protection mask dimensions differ.')
+        # Protect the confirmed label's ink, not the complete OCR rectangle. This
+        # keeps a nearby decimal removable when OCR boxes touch, while preserving
+        # the integer glyph and its anti-aliased edge through all removal masks.
+        crop=rgb[y0:y1,x0:x1]
+        gray=cv2.cvtColor(crop,cv2.COLOR_RGB2GRAY)
+        chroma=crop.max(axis=2).astype(np.int16)-crop.min(axis=2).astype(np.int16)
+        ink=((gray<238)|(chroma>=30)).astype(np.uint8)
+        # OCR boxes can overlap even when the glyphs are adjacent. In the
+        # overlap, assign ink to the closer recognized text region by its center;
+        # this keeps the integer's last digit while leaving neighboring decimal
+        # glyphs eligible for removal.
+        yy,xx=np.mgrid[y0:y1,x0:x1]
+        label_cx=x+w/2; label_cy=y+h/2
+        label_distance=(xx-label_cx)**2+(yy-label_cy)**2
+        for other in competing_boxes or []:
+            ox,oy,ow,oh=[int(other.get(k,0)) for k in ('x','y','width','height')]
+            if ow<=0 or oh<=0: continue
+            if min(x+w,ox+ow)<=max(x,ox) or min(y+h,oy+oh)<=max(y,oy): continue
+            other_distance=(xx-(ox+ow/2))**2+(yy-(oy+oh/2))**2
+            ink[other_distance<label_distance]=0
+        if cv2.countNonZero(ink):
+            # Include the annotation-mask padding and the later inpaint dilation,
+            # so the edge of a protected integer cannot be clipped by a neighbor.
+            ink=cv2.dilate(ink,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)),iterations=1)
+            protected[y0:y1,x0:x1][ink>0]=255
     return protected
 
 def exclude_protected_pixels(mask:np.ndarray, protected:np.ndarray)->np.ndarray:
@@ -208,6 +241,51 @@ def _red_ink_fraction(rgb:np.ndarray, box:dict)->float:
 
 def is_principal_integer(rgb:np.ndarray, box:dict)->bool:
     return bool(re.fullmatch(r'\d{1,4}',str(box.get('text','')).strip()) and _red_ink_fraction(rgb,box)<.12)
+
+def _is_decimal_ocr_alias(integer_box: dict, decimal_boxes: list[dict]) -> bool:
+    """Ignore a weak integer OCR reading that duplicates a decimal's same glyph region."""
+    if not re.fullmatch(r"\d{1,4}", str(integer_box.get("text", "")).strip()):
+        return False
+
+    raw_confidence = integer_box.get("confidence")
+    try:
+        confidence = float(raw_confidence) if raw_confidence is not None else 100.0
+    except (TypeError, ValueError):
+        return False
+
+    x, y, w, h = (
+        int(integer_box.get(k, 0)) for k in ("x", "y", "width", "height")
+    )
+    if w <= 0 or h <= 0:
+        return False
+
+    for decimal in decimal_boxes:
+        if not re.search(r"\d\s*[.,]\s*\d", str(decimal.get("text", ""))):
+            continue
+
+        dx, dy, dw, dh = (
+            int(decimal.get(k, 0)) for k in ("x", "y", "width", "height")
+        )
+        if dw <= 0 or dh <= 0:
+            continue
+
+        ix = max(0, min(x + w, dx + dw) - max(x, dx))
+        iy = max(0, min(y + h, dy + dh) - max(y, dy))
+        overlap = (ix * iy) / max(1, min(w * h, dw * dh))
+
+        distance = float(np.hypot(
+            x + w / 2 - (dx + dw / 2),
+            y + h / 2 - (dy + dh / 2),
+        ))
+
+        # Strongly contained OCR boxes can represent individual digits of
+        # the same decimal, even when their centres are far apart.
+        if overlap >= 0.80 or (
+            overlap >= 0.75 and distance <= 0.25 * min(h, dh)
+        ):
+            return True
+
+    return False
 
 def build_red_ink_mask(rgb:np.ndarray)->np.ndarray:
     hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
@@ -238,13 +316,26 @@ def _ocr_measurement_crop(rgb, config='--oem 1 --psm 7 -c tessedit_char_whitelis
     blue=cv2.inRange(hsv,np.array([90,45,35],np.uint8),np.array([145,255,255],np.uint8))
     gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
     # Preserve blue ink as black; this avoids grayscale loss of blue against white.
-    isolated=np.where(blue>0,0,255).astype(np.uint8)
-    variants=[isolated,cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]]
+    # For black-only crops the isolation image is entirely white and an OCR call
+    # against it cannot find the label, so skip that pass instead of paying for a
+    # guaranteed miss before the unchanged grayscale/adaptive fallbacks.
+    has_blue=cv2.countNonZero(blue)>=3
+    variants=[]
+    if has_blue: variants.append(np.where(blue>0,0,255).astype(np.uint8))
+    otsu_index=len(variants)
+    variants.append(cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1])
+    adaptive_index=None
     if min(gray.shape)>=15:
+        adaptive_index=len(variants)
         variants.append(cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,15,5))
-    # Try a few targeted fallbacks instead of a Cartesian product of every scale,
-    # threshold, and page-segmentation mode for each connected-component group.
-    attempts=((0,3,7),(1,3,7),(2,4,7),(1,4,8),(2,4,13))
+    # Keep the same OCR scales and page-segmentation fallbacks, but only execute
+    # the color-isolation pass when the crop actually contains blue annotation ink.
+    attempts=[]
+    if has_blue: attempts.append((0,3,7))
+    attempts.append((otsu_index,3,7))
+    if adaptive_index is not None: attempts.append((adaptive_index,4,7))
+    attempts.append((otsu_index,4,8))
+    if adaptive_index is not None: attempts.append((adaptive_index,4,13))
     for variant_index,scale,psm in attempts:
         if variant_index>=len(variants): continue
         variant=variants[variant_index]
@@ -296,7 +387,23 @@ def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|
     cached_labels=_read_detection_cache(cache_key,'color-integer-labels') if include_labels else None
     if cached is not None and (not include_labels or cached_labels is not None):
         return (cached,cached_labels) if include_labels else cached
-    H,W=rgb.shape[:2]; found=[]; labels_found=[]; seen=set(); seen_regions=set(); seen_label_regions=set(); overlap=80
+    H,W=rgb.shape[:2]; found=[]; labels_found=[]; pending_ocr=[]; pending_by_key={}; seen=set(); seen_regions=set(); seen_label_regions=set(); overlap=80
+    def enqueue_ocr(kind,region_key,runner,crop,box,ink):
+        key=(kind,region_key); payload=(crop.copy(),box,ink)
+        existing=pending_by_key.get(key)
+        if existing is not None:
+            # Preserve the original orientation retry order, but defer alternates
+            # until the first crop fails. This avoids duplicate OCR work while
+            # the first attempt runs concurrently with later tile analysis.
+            existing['alternatives'].append(payload)
+            return
+        entry={'kind':kind,'region_key':region_key,'runner':runner,'box':box,'ink':ink,
+               'future':OCR_EXECUTOR.submit(runner,payload[0]),'alternatives':[]}
+        pending_by_key[key]=entry; pending_ocr.append(entry)
+    # Connected components are unchanged by a 180° rotation. Reuse the 0°/90°
+    # component boxes in the opposite directions and rotate only candidate crops
+    # for OCR, avoiding two redundant full-tile color/threshold/label passes.
+    components_by_tile_rotation={}
     for rotation in (0,90,270,180):
         for y0 in range(0,H,tile_size-overlap):
             y1=min(H,y0+tile_size)
@@ -304,20 +411,33 @@ def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|
                 x1=min(W,x0+tile_size)
                 tile=rgb[y0:y1,x0:x1]
                 view=np.rot90(tile,rotation//90).copy() if rotation else tile
-                hsv=cv2.cvtColor(view,cv2.COLOR_RGB2HSV)
-                gray=cv2.cvtColor(view,cv2.COLOR_RGB2GRAY)
-                blue_mask=cv2.inRange(hsv,np.array([90,45,35],np.uint8),np.array([145,255,255],np.uint8))
-                black_mask=cv2.threshold(gray,115,255,cv2.THRESH_BINARY_INV)[1]
-                otsu_black=cv2.threshold(gray,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
-                black_mask=cv2.bitwise_or(black_mask,otsu_black)
-                black_mask[blue_mask>0]=0
-                for ink,mask in (('blue',blue_mask),('black',black_mask)):
-                    n,labels,stats,_=cv2.connectedComponentsWithStats(mask,8)
-                    comps=[]
-                    for i in range(1,n):
-                        x,y,w,h,a=map(int,stats[i])
-                        if a<1 or a>5000 or h<1 or h>140 or w>120: continue
-                        comps.append((x,y,w,h,a))
+                if rotation in (0,90):
+                    hsv=cv2.cvtColor(view,cv2.COLOR_RGB2HSV)
+                    gray=cv2.cvtColor(view,cv2.COLOR_RGB2GRAY)
+                    blue_mask=cv2.inRange(hsv,np.array([90,45,35],np.uint8),np.array([145,255,255],np.uint8))
+                    black_mask=cv2.threshold(gray,115,255,cv2.THRESH_BINARY_INV)[1]
+                    otsu_black=cv2.threshold(gray,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+                    black_mask=cv2.bitwise_or(black_mask,otsu_black)
+                    black_mask[blue_mask>0]=0
+                    components_for_ink={}
+                    for ink,component_mask in (('blue',blue_mask),('black',black_mask)):
+                        n,labels,stats,_=cv2.connectedComponentsWithStats(component_mask,8)
+                        comps=[]
+                        for i in range(1,n):
+                            cx,cy,cw,ch,area=map(int,stats[i])
+                            if area<1 or area>5000 or ch<1 or ch>140 or cw>120: continue
+                            comps.append((cx,cy,cw,ch,area))
+                        components_for_ink[ink]=comps
+                else:
+                    base_rotation=rotation-180
+                    base_width=tile.shape[1] if base_rotation==0 else tile.shape[0]
+                    base_height=tile.shape[0] if base_rotation==0 else tile.shape[1]
+                    base_components=components_by_tile_rotation[(y0,x0,base_rotation)]
+                    components_for_ink={ink:[(base_width-cx-cw,base_height-cy-ch,cw,ch,area)
+                                             for cx,cy,cw,ch,area in base]
+                                        for ink,base in base_components.items()}
+                if rotation in (0,90): components_by_tile_rotation[(y0,x0,rotation)]=components_for_ink
+                for ink,comps in components_for_ink.items():
                     # Compose glyph components into baseline-aligned line proposals.
                     unused=set(range(len(comps)))
                     while unused:
@@ -348,27 +468,52 @@ def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|
                             if not include_labels or ink!='blue' or not (8<=by1-by0<=120 and bx1-bx0<=max(30,(by1-by0)*2.5) and len(g)<=4): continue
                             rx,ry,rw,rh=map_ocr_box(bx0,by0,bx1-bx0,by1-by0,rotation,tile.shape[1],tile.shape[0]); rx+=x0; ry+=y0
                             label_key=(rx//4,ry//4,rw//4,rh//4)
-                            if label_key in seen_label_regions: continue
-                            crop=view[max(0,by0-8):min(view.shape[0],by1+8),max(0,bx0-8):min(view.shape[1],bx1+8)]
-                            label_text,label_conf=_ocr_blue_integer_crop(crop)
-                            if re.fullmatch(r'\d{1,4}',label_text):
-                                seen_label_regions.add(label_key)
-                                labels_found.append({'text':label_text,'x':rx,'y':ry,'width':rw,'height':rh,'confidence':label_conf,'kind':'principal-label','color':ink,'detection_method':'blue-component-integer-ocr'})
+                            crop=view[
+                                max(0,by0-8):min(view.shape[0],by1+8),
+                                max(0,bx0-8):min(view.shape[1],bx1+8)
+                            ]
+
+                            enqueue_ocr(
+                                'label',
+                                label_key,
+                                _ocr_blue_integer_crop,
+                                crop,
+                                (rx,ry,rw,rh),
+                                ink
+                            )
                             continue
                         rx,ry,rw,rh=map_ocr_box(bx0,by0,bx1-bx0,by1-by0,rotation,tile.shape[1],tile.shape[0])
                         rx+=x0; ry+=y0
                         region_key=(rx//4,ry//4,rw//4,rh//4)
-                        if region_key in seen_regions: continue
                         crop=view[max(0,by0-8):min(view.shape[0],by1+8),max(0,bx0-8):min(view.shape[1],bx1+8)]
-                        text,conf=_ocr_measurement_crop(crop)
-                        if not text: continue
-                        seen_regions.add(region_key)
-                        # OCR crop includes an 8px margin; return the component-derived tight box.
-                        if rw<1 or rh<1 or rx+rw>W or ry+rh>H: continue
-                        key=(text,rx//5,ry//5,rw//5,rh//5)
-                        if key in seen: continue
-                        seen.add(key)
-                        found.append({'text':text,'x':rx,'y':ry,'width':rw,'height':rh,'confidence':conf,'kind':'measurement','detection_method':f'{ink}-component-line-ocr'})
+                        enqueue_ocr('measurement',region_key,_ocr_measurement_crop,crop,(rx,ry,rw,rh),ink)
+    # Resolve in original candidate order, preserving the prior rule: a second
+    # orientation may retry a region only if earlier OCR failed to validate it.
+    for entry in pending_ocr:
+        kind=entry['kind']; region_key=entry['region_key']; ink=entry['ink']
+        result=entry['future'].result(); box=entry['box']
+        valid=(re.fullmatch(r'\d{1,4}',result[0]) is not None) if kind=='label' else bool(result[0])
+        for alternate_crop,alternate_box,alternate_ink in entry['alternatives']:
+            if valid: break
+            result=OCR_EXECUTOR.submit(entry['runner'],alternate_crop).result(); box=alternate_box; ink=alternate_ink
+            valid=(re.fullmatch(r'\d{1,4}',result[0]) is not None) if kind=='label' else bool(result[0])
+        if not valid: continue
+        rx,ry,rw,rh=box
+        if kind=='label':
+            if region_key in seen_label_regions: continue
+            label_text,label_conf=result
+            seen_label_regions.add(region_key)
+            labels_found.append({'text':label_text,'x':rx,'y':ry,'width':rw,'height':rh,'confidence':label_conf,'kind':'principal-label','color':ink,'detection_method':'blue-component-integer-ocr'})
+            continue
+        if region_key in seen_regions: continue
+        text,conf=result
+        seen_regions.add(region_key)
+        # OCR crop includes an 8px margin; return the component-derived tight box.
+        if rw<1 or rh<1 or rx+rw>W or ry+rh>H: continue
+        key=(text,rx//5,ry//5,rw//5,rh//5)
+        if key in seen: continue
+        seen.add(key)
+        found.append({'text':text,'x':rx,'y':ry,'width':rw,'height':rh,'confidence':conf,'kind':'measurement','detection_method':f'{ink}-component-line-ocr'})
     _write_detection_cache(cache_key,'color-measurements',found)
     if include_labels:
         _write_detection_cache(cache_key,'color-integer-labels',labels_found)
@@ -390,7 +535,24 @@ def _ocr_oriented_measurement(rgb:np.ndarray,angle:float,ink:str):
     else: mask=cv2.threshold(gray,115,255,cv2.THRESH_BINARY_INV)[1]
     isolated=np.where(mask>0,0,255).astype(np.uint8)
     fallback=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-    configs=[(angle,isolated,7,2),(angle,isolated,7,3),(angle,isolated,10,2),(angle,isolated,11,2),(angle,fallback,7,2),(angle-10,isolated,7,2),(angle+10,isolated,7,2)]
+    configs = [
+        (angle, isolated, 7, 2),
+        (angle, isolated, 7, 3),
+        (angle, isolated, 10, 2),
+        (angle, isolated, 11, 2),
+        (angle, fallback, 7, 2),
+        (angle - 10, isolated, 7, 2),
+        (angle + 10, isolated, 7, 2),
+    ]
+
+    # PCA identifies a line's axis, but either direction along that axis is valid.
+    # If normal deskew attempts fail, try the opposite text orientation.
+    opposite_angle = angle - 180 if angle >= 0 else angle + 180
+    configs.extend([
+        (opposite_angle, isolated, 7, 2),
+        (opposite_angle - 10, isolated, 7, 2),
+        (opposite_angle + 10, isolated, 7, 2),
+    ])
     for theta,variant,psm,scale in configs:
         rotated=_rotate_expand(variant,theta)
         canvas=cv2.copyMakeBorder(rotated,18,18,18,18,cv2.BORDER_CONSTANT,value=255)
@@ -472,8 +634,20 @@ def detect_oriented_measurements(rgb:np.ndarray,tile_size:int=3072,*,cache_key:s
                     pad=max(18,int(median_h*.38)); cx0=max(0,bx0-pad); cy0=max(0,by0-pad); cx1=min(tile.shape[1],bx1+pad); cy1=min(tile.shape[0],by1+pad)
                     text,confidence=_ocr_oriented_measurement(tile[cy0:cy1,cx0:cx1],round(angle/5)*5,ink)
                     if not text: continue
-                    boxes=[{'x':x0+comps[i][0],'y':y0+comps[i][1],'width':comps[i][2],'height':comps[i][3]} for i in indices]
-                    rx=x0+bx0; ry=y0+by0; rw=bx1-bx0; rh=by1-by0
+                    boxes = [
+                        {
+                            'x': x0 + comps[i][0],
+                            'y': y0 + comps[i][1],
+                            'width': comps[i][2],
+                            'height': comps[i][3],
+                        }
+                        for i in indices
+                    ]
+
+                    rx = x0 + bx0
+                    ry = y0 + by0
+                    rw = bx1 - bx0
+                    rh = by1 - by0
                     key=(text,rx//5,ry//5,rw//5,rh//5)
                     if key in seen: continue
                     seen.add(key)
@@ -587,7 +761,7 @@ def finish_job_timing(jid):
 def _clean_candidate(jid, aid, path):
     try:
         source_stat=Path(path).stat()
-        detection_cache_key=f'{aid}:{source_stat.st_size}:{source_stat.st_mtime_ns}:detectors-v3'
+        detection_cache_key=f'{aid}:{source_stat.st_size}:{source_stat.st_mtime_ns}:detectors-v10'
         update_job(jid,status='processing')
         set_stage(jid,'loading',3,'Loading source image')
         rgb=read_rgb(path); gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
@@ -685,19 +859,19 @@ def _clean_candidate(jid, aid, path):
                 if 8<=length<=45: dashed.append({'x1':x1,'y1':y1,'x2':x2,'y2':y2,'confidence':'review'})
         set_stage(jid,'mask_creation',62,'Creating full-resolution removal masks')
         protected_boxes=[b['protected_box'] for b in merged_labels if isinstance(b.get('protected_box'),dict)]
-        # Red integers are survey-point annotations, not principal parcel labels.
-        # Blue component OCR and neutral (usually black) integer labels remain
-        # protected, while red annotation glyphs flow through the red mask.
-        integer_detections=[b for b in detected if is_principal_integer(rgb,b)]
-        known_measurements=removable+merged_labels
+        decimal_boxes = [
+            b for b in removable
+            if re.search(r"\d\s*[.,]\s*\d", str(b.get("text", "")))
+            and float(b.get("confidence", 0) or 0) >= 85
+        ]
+
+        integer_detections = [
+            b for b in detected
+            if is_principal_integer(rgb, b)
+            and not _is_decimal_ocr_alias(b, decimal_boxes)
+        ]
         principal_boxes=[]
-        for label in integer_detections:
-            area=max(1,label['width']*label['height']); overlaps_decimal=False
-            for measurement in known_measurements:
-                ix=max(0,min(label['x']+label['width'],measurement['x']+measurement['width'])-max(label['x'],measurement['x']))
-                iy=max(0,min(label['y']+label['height'],measurement['y']+measurement['height'])-max(label['y'],measurement['y']))
-                if ix*iy>.2*area: overlaps_decimal=True; break
-            if not overlaps_decimal: principal_boxes.append(label)
+        principal_boxes.extend(integer_detections)
         principal_boxes.extend(dict(b,text=b.get('protected_text','')) for b in protected_boxes)
         unique_principal_boxes=[]; seen_principal=set()
         for b in principal_boxes:
@@ -705,16 +879,24 @@ def _clean_candidate(jid, aid, path):
             if key not in seen_principal: seen_principal.add(key); unique_principal_boxes.append(b)
         accepted=[]
         for b in removable:
-            overlaps=False
+            ambiguous=False
             for pbox in unique_principal_boxes:
                 ix=max(0,min(b['x']+b['width'],pbox['x']+pbox['width'])-max(b['x'],pbox['x']))
                 iy=max(0,min(b['y']+b['height'],pbox['y']+pbox['height'])-max(b['y'],pbox['y']))
-                if ix*iy > .03*pbox['width']*pbox['height']: overlaps=True; break
-            if overlaps: uncertain.append(dict(b,kind='measurement-overlaps-principal-label'))
+                if ix<=0 or iy<=0: continue
+                # Rectangular overlap alone is not ambiguity. Only near-coincident
+                # text centers are withheld; separated glyph trains are resolved
+                # by the pixel-level nearest-label mask above.
+                distance=float(np.hypot((b['x']+b['width']/2)-(pbox['x']+pbox['width']/2),
+                                        (b['y']+b['height']/2)-(pbox['y']+pbox['height']/2)))
+                scale=max(1.0,min(b['height'],pbox['height']))
+                if distance < .35*scale: ambiguous=True; break
+            if ambiguous: uncertain.append(dict(b,kind='measurement-overlaps-principal-label'))
             else: accepted.append(b)
         measurement_mask=np.zeros(gray.shape,np.uint8); red_removal_mask=np.zeros(gray.shape,np.uint8)
         safe_principal_detections=principal_boxes[:]
-        protected_mask=build_principal_label_mask(gray.shape,safe_principal_detections,merged_labels,padding=2)
+        protected_mask=build_principal_label_mask(gray.shape,safe_principal_detections,merged_labels,padding=2,
+                                                  rgb=rgb,competing_boxes=accepted+merged_labels)
         for b in accepted+merged_labels:
             pad=1 if b in merged_labels else 2
             components=b.get('component_boxes')

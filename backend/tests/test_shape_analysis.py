@@ -9,6 +9,27 @@ from app.main import apply_removal_mask, detect_color_measurements, detect_orien
 from app.shape_analysis import detect_box_symbols, detect_dashed_guides, build_guide_removal_mask, build_blue_symbol_mask
 
 class ShapeAnalysisTests(unittest.TestCase):
+    def test_short_diagonal_dash_train_is_detected_and_removed_without_touching_plot_or_boundary(self):
+        image=np.full((260,520,3),255,np.uint8)
+        for x in range(24,470,27):
+            y=28+round((x-24)*.24)
+            cv2.line(image,(x,y),(x+11,y+3),(0,0,0),2)
+        cv2.line(image,(14,204),(506,204),(0,0,0),3)
+        cv2.putText(image,'15',(280,152),cv2.FONT_HERSHEY_SIMPLEX,1.15,(0,0,0),2,cv2.LINE_AA)
+        gray=cv2.cvtColor(image,cv2.COLOR_RGB2GRAY)
+        labels=np.zeros(gray.shape,np.uint8); labels[114:159,270:320]=255
+        candidates=detect_dashed_guides(gray,tile_size=520,rgb=image)
+        train=next((q for q in candidates if q.get('orientation')=='diagonal'
+                    and q.get('classification')=='high-confidence-removable'),None)
+        self.assertIsNotNone(train,candidates)
+        mask,protected,classified=build_guide_removal_mask(gray,[train],image,labels)
+        cleaned=apply_removal_mask(image,mask,dilation=0,protected=protected)
+        self.assertGreater(cv2.countNonZero(mask),40)
+        self.assertTrue(np.array_equal(image[114:159,270:320],cleaned[114:159,270:320]),'plot number changed')
+        self.assertTrue(np.array_equal(image[200:209,:],cleaned[200:209,:]),'parcel boundary changed')
+        self.assertGreater(np.count_nonzero(np.any(image[:150]!=cleaned[:150],axis=2)),50)
+        self.assertGreater(classified[0]['mask_pixels'],0)
+
     def test_component_dash_train_removes_only_diagonal_ink_and_protects_label_and_boundary(self):
         image=np.full((280,520,3),255,np.uint8)
         # Diagonal dash train; the solid cadastral edge and principal integer are

@@ -6,7 +6,7 @@ import numpy as np
 import uuid
 from fastapi import BackgroundTasks, HTTPException
 
-from app.main import apply_removal_mask, build_principal_label_mask, build_red_ink_mask, is_principal_integer, exclude_protected_pixels, _has_decimal_component_signature, map_ocr_box, detect_merged_measurement_labels, detect_color_measurements, detect_oriented_measurements, _ocr_small_region, _write_detection_cache, _cache_path, assets, jobs, PROCESSED_DIR, ORIGINALS_DIR, THUMB_DIR, MANUAL_EDITS_DIR, JOBS_DIR, persist_job, normalize_asset_record, public_asset, list_maps, delete_map, thumbnail, map_preview, job_preview, export_png, approve, edit_candidate, save_manual_edits, get_manual_edits, Approval, process_map, _removal_has_evidence
+from app.main import apply_removal_mask, build_principal_label_mask, build_red_ink_mask, is_principal_integer, exclude_protected_pixels, _has_decimal_component_signature, map_ocr_box, detect_merged_measurement_labels, detect_color_measurements, detect_oriented_measurements, _ocr_small_region, _write_detection_cache, _cache_path, assets, jobs, PROCESSED_DIR, ORIGINALS_DIR, THUMB_DIR, MANUAL_EDITS_DIR, JOBS_DIR, persist_job, normalize_asset_record, public_asset, list_maps, delete_map, thumbnail, map_preview, job_preview, export_png, approve, edit_candidate, save_manual_edits, get_manual_edits, Approval, process_map, _removal_has_evidence, _is_decimal_ocr_alias
 from app.manual_edits import display_to_source_point
 
 
@@ -60,6 +60,27 @@ class CleaningPixelTests(unittest.TestCase):
             self.assertTrue(np.array_equal(image[y-h-4:y+3,x-3:x+w+4],candidate[y-h-4:y+3,x-3:x+w+4]),f'principal label {text} changed')
         self.assertTrue(np.array_equal(image[102:109,20:340],candidate[102:109,20:340]),'parcel boundary changed')
         self.assertGreater(np.count_nonzero(np.any(image[116:153,132:202]!=candidate[116:153,132:202],axis=2)),20,'decimal measurement was not cleaned')
+
+    def test_plot_number_ink_survives_overlapping_decimal_boxes(self):
+        image=np.full((150,280,3),255,np.uint8)
+        cv2.putText(image,'21',(112,67),cv2.FONT_HERSHEY_SIMPLEX,.9,(0,0,0),2,cv2.LINE_AA)
+        cv2.putText(image,'8.8',(151,67),cv2.FONT_HERSHEY_SIMPLEX,.65,(0,0,0),2,cv2.LINE_AA)
+        cv2.line(image,(15,102),(265,102),(0,0,0),3)
+        # These OCR rectangles intentionally overlap even though their glyphs are
+        # spatially distinct, as happens when a decimal is immediately adjacent.
+        principal={'text':'21','x':108,'y':39,'width':47,'height':34,'kind':'principal-label'}
+        measurement={'text':'8.8','x':143,'y':43,'width':56,'height':29,'kind':'measurement'}
+        protected=build_principal_label_mask(image.shape[:2],[principal],[],padding=2,rgb=image,competing_boxes=[measurement])
+        removal=np.zeros(image.shape[:2],np.uint8)
+        cv2.rectangle(removal,(measurement['x']-2,measurement['y']-2),
+                      (measurement['x']+measurement['width']+2,measurement['y']+measurement['height']+2),255,-1)
+        removal=exclude_protected_pixels(removal,protected)
+        candidate=apply_removal_mask(image,removal,dilation=2,protected=protected)
+        number_roi=image[43:72,109:148]
+        number_ink=cv2.cvtColor(number_roi,cv2.COLOR_RGB2GRAY)<238
+        self.assertTrue(np.array_equal(number_roi[number_ink],candidate[43:72,109:148][number_ink]),'plot number 21 ink was altered')
+        self.assertGreater(np.count_nonzero(np.any(image[43:72,148:200]!=candidate[43:72,148:200],axis=2)),10,'nearby decimal was retained')
+        self.assertTrue(np.array_equal(image[99:106,:],candidate[99:106,:]),'parcel boundary was altered')
 
     def test_integer_groups_are_filtered_before_color_ocr_but_decimal_geometry_is_retained(self):
         integer=[(0,0,10,20,45),(12,0,10,20,43)]
@@ -321,7 +342,8 @@ class CleaningPixelTests(unittest.TestCase):
         self.assertTrue(np.array_equal(source[142:149,20:600],cleaned[142:149,20:600]),'nearby parcel boundary changed')
 
     def test_rotated_blue_and_horizontal_black_decimal_detection(self):
-        for ink,rotation in (((0,0,230),cv2.ROTATE_90_CLOCKWISE),((0,0,0),None)):
+        for ink,rotation in (((0,0,230),cv2.ROTATE_90_CLOCKWISE),((0,0,230),cv2.ROTATE_180),
+                            ((0,0,0),cv2.ROTATE_90_COUNTERCLOCKWISE),((0,0,0),None)):
             image=np.full((220,400,3),255,np.uint8)
             cv2.putText(image,'45.6',(100,105),cv2.FONT_HERSHEY_DUPLEX,1.3,ink,2,cv2.LINE_AA)
             if rotation is not None: image=cv2.rotate(image,rotation)
@@ -417,6 +439,83 @@ class CleaningPixelTests(unittest.TestCase):
                 self.assertEqual(invalidated.exception.status_code, 403)
         finally:
             assets.pop(asset_id, None); jobs.pop(job_id, None); artifact.unlink(missing_ok=True)
+
+    def test_weak_integer_ocr_alias_does_not_block_decimal_measurement(self):
+        decimal = {
+            "text": "35.2", "x": 5864, "y": 4766,
+            "width": 136, "height": 51, "confidence": 93,
+        }
+        alias = {
+            "text": "352", "x": 5863, "y": 4767,
+            "width": 121, "height": 51, "confidence": 0,
+        }
+        digit_alias = {
+            "text": "1", "x": 4212, "y": 9437,
+            "width": 33, "height": 52, "confidence": 0,
+        }
+        real_measurement = {
+            "text": "35.2", "x": 4170, "y": 9433,
+            "width": 138, "height": 58, "confidence": 95,
+        }
+        contained_digit = {
+            "text": "6",
+            "x": 3936, "y": 4713,
+            "width": 67, "height": 51,
+            "confidence": 96,
+        }
+        wide_decimal = {
+            "text": "25.6",
+            "x": 3863, "y": 4714,
+            "width": 139, "height": 52,
+            "confidence": 96,
+        }
+        vertical_decimal = {
+            "text": "0.6", "x": 3624, "y": 5859,
+            "width": 66, "height": 125, "confidence": 100,
+        }
+        label_20 = {
+            "text": "20", "x": 3634, "y": 5904,
+            "width": 57, "height": 98, "confidence": 0,
+        }
+
+        self.assertTrue(_is_decimal_ocr_alias(label_20, [vertical_decimal]))
+
+        decimal_28 = {
+            "text": "28.2", "x": 2051, "y": 7824,
+            "width": 55, "height": 128, "confidence": 100,
+        }
+        label_8 = {
+            "text": "8", "x": 2051, "y": 7886,
+            "width": 53, "height": 76, "confidence": 0,
+        }
+        label_28 = {
+            "text": "28", "x": 2051, "y": 7872,
+            "width": 53, "height": 90, "confidence": 0,
+        }
+
+        self.assertTrue(_is_decimal_ocr_alias(label_8, [decimal_28]))
+        self.assertTrue(_is_decimal_ocr_alias(label_28, [decimal_28]))
+
+        self.assertTrue(
+            _is_decimal_ocr_alias(contained_digit, [wide_decimal])
+        )
+
+        self.assertTrue(
+            _is_decimal_ocr_alias(digit_alias, [real_measurement])
+        )
+
+        self.assertTrue(_is_decimal_ocr_alias(alias, [decimal]))
+
+        genuine_label = {
+            "text": "21", "x": 100, "y": 100,
+            "width": 40, "height": 30, "confidence": 96,
+        }
+        self.assertFalse(_is_decimal_ocr_alias(genuine_label, [decimal]))
+
+        confident_integer = {**alias, "confidence": 68}
+        self.assertTrue(
+            _is_decimal_ocr_alias(confident_integer, [decimal])
+        )
 
 
 if __name__ == '__main__':

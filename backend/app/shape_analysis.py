@@ -112,7 +112,10 @@ def _component_dash_trains(gray: np.ndarray, rgb: np.ndarray | None = None,
             count, labels, stats, centers = cv2.connectedComponentsWithStats(ink, 8)
             for label in range(1, count):
                 x, y, cw, ch, area = map(int, stats[label])
-                if area < 25 or min(cw, ch) < 2 or max(cw, ch) < 18:
+                # Short dash strokes are common in scanned sheets. Keep compact
+                # elongated components as evidence; removal still requires a
+                # multi-component periodic train below.
+                if area < 8 or max(cw, ch) < 8:
                     continue
                 cx, cy = x + cw / 2, y + ch / 2
                 # The tile overlap makes the component complete in the owning tile.
@@ -126,7 +129,7 @@ def _component_dash_trains(gray: np.ndarray, rgb: np.ndarray | None = None,
                 seen.add(key)
                 yy, xx = np.where(labels[y:y + ch, x:x + cw] == label)
                 points = np.column_stack((xx + x, yy + y)).astype(np.float32)
-                if len(points) < 25:
+                if len(points) < 8:
                     continue
                 vx, vy, mx, my = cv2.fitLine(points, cv2.DIST_L2, 0, .01, .01).flatten()[:4]
                 if vx < 0:
@@ -138,7 +141,7 @@ def _component_dash_trains(gray: np.ndarray, rgb: np.ndarray | None = None,
                 slenderness = length / max(1.0, thickness)
                 # A boundary intersection/branch usually makes the component
                 # wider or less line-like; retain those as review-only evidence.
-                if length < 18 or thickness > 14 or slenderness < 8:
+                if length < 8 or thickness > 14 or slenderness < 3.5:
                     continue
                 angle = float(np.degrees(np.arctan2(vy, vx)))
                 normal_at_origin = float(-vy * (mx + x0) + vx * (my + y0))
@@ -182,6 +185,10 @@ def _component_dash_trains(gray: np.ndarray, rgb: np.ndarray | None = None,
         lengths = np.asarray([q['length'] for q in group], np.float32)
         gaps = np.asarray([group[i + 1]['start'] - group[i]['end'] for i in range(len(group) - 1)], np.float32)
         median_length = float(np.median(lengths))
+        # A short aligned word can also form a row of components. A guide train
+        # must span several dash lengths before it can become a removal proposal.
+        if group[-1]['end'] - group[0]['start'] < median_length * 4.0:
+            continue
         valid_gaps = gaps[(gaps >= max(3.0, median_length * .12)) & (gaps <= median_length * 4.0)]
         if len(valid_gaps) < 3:
             continue
@@ -432,9 +439,19 @@ def build_guide_removal_mask(gray: np.ndarray, candidates: list[dict], rgb:np.nd
         if not eligible:
             candidate['classification']='ambiguous-review'; classified.append(candidate); continue
         stroke=max(1,min(4,int(round(min(h,w)*.00025))))
-        corridor=np.zeros_like(removal); cv2.line(corridor,(x1,y1),(x2,y2),255,2*stroke+1)
         nx=-(y2-y1)/max(length,1); ny=(x2-x1)/max(length,1)
         boundary_reach=max(12,min(32,int(round(min(h,w)*.01))))
+        # Work in a candidate-local ROI. The previous implementation allocated
+        # and dilated full-map masks for every proposal; hundreds of candidates
+        # caused avoidable full-resolution memory traffic.
+        pad=boundary_reach+5
+        rx0=max(0,min(x1,x2)-pad); ry0=max(0,min(y1,y2)-pad)
+        rx1=min(w,max(x1,x2)+pad+1); ry1=min(h,max(y1,y2)+pad+1)
+        if rx1<=rx0 or ry1<=ry0:
+            candidate.update(classification='ambiguous-review',mask_pixels=0,review_required=True,
+                             review_reason='candidate lies outside the image')
+            classified.append(candidate); continue
+        local_boundary=boundary_ink[ry0:ry1,rx0:rx1]
         t=np.arange(0,length+1,max(1,stroke),dtype=np.float32)
         offsets=np.arange(-boundary_reach,boundary_reach+1,dtype=np.float32)
         xs=np.rint(x1+(x2-x1)*t[:,None]/max(length,1)+nx*offsets[None,:]).astype(np.int32)
@@ -463,13 +480,13 @@ def build_guide_removal_mask(gray: np.ndarray, candidates: list[dict], rgb:np.nd
             candidate.update(classification='ambiguous-review',mask_pixels=0,protected_boundary_pixels=0,
                              review_required=True,review_reason='observed line support is not a sufficiently sparse periodic dash train')
             classified.append(candidate); continue
-        dash_mask=np.zeros_like(removal)
+        dash_mask=np.zeros((ry1-ry0,rx1-rx0),np.uint8)
         for start,end in zip(dash_starts,dash_ends):
             if end-start<2: continue
             ax=int(round(x1+(x2-x1)*start/max(length,1))); ay=int(round(y1+(y2-y1)*start/max(length,1)))
             bx=int(round(x1+(x2-x1)*(end-1)/max(length,1))); by=int(round(y1+(y2-y1)*(end-1)/max(length,1)))
-            cv2.line(dash_mask,(ax,ay),(bx,by),255,2*stroke+1)
-        candidate_ink=cv2.bitwise_and(dash_mask,(gray<180).astype(np.uint8)*255)
+            cv2.line(dash_mask,(ax-rx0,ay-ry0),(bx-rx0,by-ry0),255,2*stroke+1)
+        candidate_ink=cv2.bitwise_and(dash_mask,(gray[ry0:ry1,rx0:rx1]<180).astype(np.uint8)*255)
         # Thin and faint cadastral strokes may occupy only a few normal samples;
         # a lower evidence threshold protects them conservatively at crossings.
         # Exclude the expected guide stroke, not a broad halo: a thin parcel edge
@@ -479,15 +496,15 @@ def build_guide_removal_mask(gray: np.ndarray, candidates: list[dict], rgb:np.nd
         boundary_rows=(values.sum(axis=1)>=max(4,boundary_reach//8))&boundary_evidence.any(axis=1)
         if np.any(boundary_rows):
             row_mask=boundary_rows[:,None]&values&(~center_exclusion[None,:])&inside
-            protected[ys[row_mask],xs[row_mask]]=255
-            # Expand only observed boundary ink. A disk around each nearby crossing
-            # used to cover the guide itself when a real parcel edge ran in parallel.
-            protected=cv2.dilate(protected,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)),iterations=1)
-            protected[~boundary_ink]=0
-        candidate_ink[protected>0]=0
-        removal=cv2.bitwise_or(removal,candidate_ink)
-        candidate_ink[protected>0]=0
-        candidate['mask_pixels']=int(cv2.countNonZero(candidate_ink)); candidate['protected_boundary_pixels']=int(cv2.countNonZero(cv2.bitwise_and(dash_mask,protected)))
+            crossing=np.zeros_like(dash_mask)
+            crossing[ys[row_mask]-ry0,xs[row_mask]-rx0]=255
+            crossing=cv2.dilate(crossing,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)),iterations=1)
+            crossing[~local_boundary]=0
+            protected[ry0:ry1,rx0:rx1]=cv2.bitwise_or(protected[ry0:ry1,rx0:rx1],crossing)
+        local_protected=protected[ry0:ry1,rx0:rx1]
+        candidate_ink[local_protected>0]=0
+        removal[ry0:ry1,rx0:rx1]=cv2.bitwise_or(removal[ry0:ry1,rx0:rx1],candidate_ink)
+        candidate['mask_pixels']=int(cv2.countNonZero(candidate_ink)); candidate['protected_boundary_pixels']=int(cv2.countNonZero(cv2.bitwise_and(dash_mask,local_protected)))
         candidate['review_required']=bool(candidate['protected_boundary_pixels'])
         candidate['review_reason']='guide crosses or approaches protected boundary pixels' if candidate['review_required'] else None
         candidate['classification']='ambiguous-review' if candidate['review_required'] or not candidate['mask_pixels'] else 'high-confidence-removable'
