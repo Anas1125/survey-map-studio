@@ -242,6 +242,387 @@ def _component_dash_trains(gray: np.ndarray, rgb: np.ndarray | None = None,
     return candidates
 
 
+
+def _compact_diagonal_dash_trains(
+    gray: np.ndarray,
+    rgb: np.ndarray | None = None,
+    tile_size: int = 1024,
+) -> list[dict]:
+    # Compact fallback for detached diagonal marks. Use larger overlapping tiles
+    # so short trains near the standard 1024-pixel tile seam remain together.
+    h, w = gray.shape[:2]
+    tile_size = max(int(tile_size), 2048)
+    overlap = 48
+    step = max(64, tile_size - overlap)
+    found: list[dict] = []
+
+    for y0 in range(0, h, step):
+        for x0 in range(0, w, step):
+            y1 = min(h, y0 + tile_size)
+            x1 = min(w, x0 + tile_size)
+            tile = gray[y0:y1, x0:x1]
+
+            if rgb is None:
+                ink = tile < 165
+            else:
+                color = rgb[y0:y1, x0:x1].astype(np.int16)
+                chroma = color.max(axis=2) - color.min(axis=2)
+                ink = (tile < 165) & (chroma < 38)
+
+            count, labels, stats, centers = cv2.connectedComponentsWithStats(
+                ink.astype(np.uint8), 8
+            )
+            components: list[dict] = []
+
+            for label in range(1, count):
+                x, y, cw, ch, area = map(int, stats[label])
+                if not (
+                    20 <= area <= 260
+                    and 8 <= cw <= 18
+                    and 7 <= ch <= 18
+                    and 0.70 <= cw / max(1, ch) <= 1.45
+                ):
+                    continue
+
+                cx_local, cy_local = map(float, centers[label])
+                # Assign each component to one tile while preserving seam coverage.
+                if (
+                    (x0 and cx_local < overlap / 2)
+                    or (y0 and cy_local < overlap / 2)
+                    or (x1 < w and cx_local >= (x1 - x0) - overlap / 2)
+                    or (y1 < h and cy_local >= (y1 - y0) - overlap / 2)
+                ):
+                    continue
+
+                cx, cy = x0 + cx_local, y0 + cy_local
+                components.append({
+                    "center": (cx, cy),
+                    "area": area,
+                    "box": {
+                        "x": x0 + x,
+                        "y": y0 + y,
+                        "width": cw,
+                        "height": ch,
+                        "component_area": area,
+                        "component_cx": cx,
+                        "component_cy": cy,
+                    },
+                })
+
+            if len(components) < 3:
+                continue
+
+            points = np.asarray(
+                [item["center"] for item in components], dtype=np.float32
+            )
+            areas = np.asarray([item["area"] for item in components], dtype=np.float32)
+
+            # Neighbor buckets avoid considering every pair in a dense tile.
+            bucket_size = 72.0
+            buckets: dict[tuple[int, int], list[int]] = {}
+            for i, point in enumerate(points):
+                cell = (int(point[0] // bucket_size), int(point[1] // bucket_size))
+                buckets.setdefault(cell, []).append(i)
+
+            seed_pairs: set[tuple[int, int]] = set()
+            for i, point in enumerate(points):
+                cell_x = int(point[0] // bucket_size)
+                cell_y = int(point[1] // bucket_size)
+                for bx in range(cell_x - 1, cell_x + 2):
+                    for by in range(cell_y - 1, cell_y + 2):
+                        for j in buckets.get((bx, by), []):
+                            if j <= i:
+                                continue
+                            delta = points[j] - point
+                            distance = float(np.hypot(delta[0], delta[1]))
+                            if not 18.0 <= distance <= 72.0:
+                                continue
+                            angle = abs(float(np.degrees(np.arctan2(delta[1], delta[0]))))
+                            angle = min(angle, 180.0 - angle)
+                            if 25.0 <= angle <= 75.0:
+                                seed_pairs.add((i, j))
+
+            possible_chains: set[tuple[int, ...]] = set()
+            for i, j in sorted(seed_pairs):
+                delta = points[j] - points[i]
+                distance = float(np.hypot(delta[0], delta[1]))
+                if distance <= 0:
+                    continue
+                direction = delta / distance
+                if direction[0] < 0:
+                    direction = -direction
+                angle = abs(float(np.degrees(np.arctan2(direction[1], direction[0]))))
+                if not 25.0 <= angle <= 75.0:
+                    continue
+
+                normal = np.asarray([-direction[1], direction[0]], dtype=np.float32)
+                projections = points @ direction
+                normal_values = points @ normal
+                aligned = np.flatnonzero(np.abs(normal_values - normal_values[i]) <= 3.5)
+                if len(aligned) < 3:
+                    continue
+
+                ordered = aligned[np.argsort(projections[aligned])]
+                gaps = np.diff(projections[ordered])
+                split_points = np.flatnonzero((gaps < 18.0) | (gaps > 72.0)) + 1
+                for chain in np.split(ordered, split_points):
+                    if len(chain) < 3:
+                        continue
+                    chain_gaps = np.diff(projections[chain])
+                    if np.any(chain_gaps < 18.0) or np.any(chain_gaps > 72.0):
+                        continue
+                    gap_cv = float(np.std(chain_gaps) / (np.mean(chain_gaps) + 1e-6))
+                    if gap_cv > 0.30:
+                        continue
+                    span = float(projections[chain[-1]] - projections[chain[0]])
+                    if span < 45.0:
+                        continue
+                    area_cv = float(np.std(areas[chain]) / (np.mean(areas[chain]) + 1e-6))
+                    if area_cv > 0.55:
+                        continue
+                    possible_chains.add(tuple(sorted(map(int, chain))))
+
+            accepted: list[set[int]] = []
+            for members in sorted(possible_chains, key=lambda key: (-len(key), key)):
+                member_set = set(members)
+                if any(len(member_set & previous) >= 2 for previous in accepted):
+                    continue
+                accepted.append(member_set)
+
+                group_points = points[list(members)]
+                centered = group_points - group_points.mean(axis=0)
+                _, _, vt = np.linalg.svd(centered, full_matrices=False)
+                direction = vt[0]
+                if direction[0] < 0:
+                    direction = -direction
+                projection = group_points @ direction
+                order = np.argsort(projection)
+                ordered_members = [members[int(k)] for k in order]
+                ordered_points = group_points[order]
+                ordered_projection = projection[order]
+                gaps = np.diff(ordered_projection)
+                if len(gaps) < 2 or np.any(gaps < 18.0) or np.any(gaps > 72.0):
+                    continue
+                gap_cv = float(np.std(gaps) / (np.mean(gaps) + 1e-6))
+                if gap_cv > 0.30:
+                    continue
+
+                first, last = ordered_points[0], ordered_points[-1]
+                found.append({
+                    "x1": int(round(float(first[0]))),
+                    "y1": int(round(float(first[1]))),
+                    "x2": int(round(float(last[0]))),
+                    "y2": int(round(float(last[1]))),
+                    "kind": "connected-component-dash-train",
+                    "classification": "high-confidence-removable",
+                    "confidence": round(max(0.0, 1.0 - gap_cv), 3),
+                    "dash_runs": len(ordered_members),
+                    "dash_gap_cv": round(gap_cv, 3),
+                    "orientation": "diagonal",
+                    "detection_method": "collinear-connected-components",
+                    "component_boxes": [components[k]["box"] for k in ordered_members],
+                    "review_required": False,
+                    "review_reason": None,
+                })
+
+    # Deduplicate equivalent chains generated from different pairs.
+    unique: list[dict] = []
+    seen_chains: set[tuple[tuple[int, int, int, int], ...]] = set()
+    for item in sorted(found, key=lambda value: (-value["dash_runs"], value["x1"], value["y1"])):
+        key = tuple(sorted(
+            (b["x"], b["y"], b["width"], b["height"])
+            for b in item["component_boxes"]
+        ))
+        if key in seen_chains:
+            continue
+        if any(len(set(key) & set(old_key)) >= 3 for old_key in seen_chains):
+            continue
+        seen_chains.add(key)
+        unique.append(item)
+    return unique
+
+
+
+def _attach_aligned_solid_components(
+    gray: np.ndarray,
+    candidates: list[dict],
+    rgb: np.ndarray | None = None,
+    tile_size: int = 1024,
+) -> list[dict]:
+    """Attach a nearby, isolated solid stroke to a confirmed compact dash train.
+
+    Geometry-only, conservative association: the solid component must be thin,
+    diagonal, collinear with the train, and separated from a chain endpoint by a
+    bounded blank gap. The candidate stores the exact component box; the remover
+    never rasterizes the gap between the stroke and dashes.
+    """
+    eligible = [
+        item for item in candidates
+        if item.get("detection_method") == "collinear-connected-components"
+        and item.get("orientation") == "diagonal"
+        and item.get("classification") == "high-confidence-removable"
+        and len(item.get("component_boxes", [])) >= 3
+    ]
+    if not eligible:
+        return candidates
+
+    h, w = gray.shape[:2]
+    tile_size = max(1024, int(tile_size))
+    overlap = 48
+    step = max(64, tile_size - overlap)
+    solid_components: list[dict] = []
+    seen: set[tuple[int, int, int, int]] = set()
+
+    for y0 in range(0, h, step):
+        for x0 in range(0, w, step):
+            y1 = min(h, y0 + tile_size)
+            x1 = min(w, x0 + tile_size)
+            tile = gray[y0:y1, x0:x1]
+
+            if rgb is None:
+                ink = (tile < 165).astype(np.uint8)
+            else:
+                color = rgb[y0:y1, x0:x1].astype(np.int16)
+                chroma = color.max(axis=2) - color.min(axis=2)
+                ink = ((tile < 165) & (chroma < 38)).astype(np.uint8)
+
+            count, labels, stats, centers = cv2.connectedComponentsWithStats(
+                ink, connectivity=8
+            )
+            for label in range(1, count):
+                x, y, bw, bh, area = map(int, stats[label])
+                if area < 260 or max(bw, bh) < 32:
+                    continue
+
+                cx_local, cy_local = map(float, centers[label])
+                # Own a component in only one overlapping tile.
+                if (
+                    (x0 and cx_local < overlap / 2)
+                    or (y0 and cy_local < overlap / 2)
+                    or (x1 < w and cx_local >= (x1 - x0) - overlap / 2)
+                    or (y1 < h and cy_local >= (y1 - y0) - overlap / 2)
+                ):
+                    continue
+
+                key = (x0 + x, y0 + y, bw, bh)
+                if key in seen:
+                    continue
+
+                local_y, local_x = np.where(labels[y:y + bh, x:x + bw] == label)
+                if len(local_x) < 100:
+                    continue
+                points = np.column_stack((local_x + x + x0, local_y + y + y0)).astype(np.float32)
+                vx, vy, _, _ = cv2.fitLine(
+                    points, cv2.DIST_L2, 0, 0.01, 0.01
+                ).flatten()[:4]
+                if vx < 0:
+                    vx, vy = -vx, -vy
+
+                direction = np.asarray([vx, vy], dtype=np.float32)
+                direction /= max(1e-6, float(np.linalg.norm(direction)))
+                angle = abs(float(np.degrees(np.arctan2(direction[1], direction[0]))))
+                if not 25.0 <= angle <= 75.0:
+                    continue
+
+                normal = np.asarray([-direction[1], direction[0]], dtype=np.float32)
+                along_values = points @ direction
+                normal_values = points @ normal
+                length = float(along_values.max() - along_values.min())
+                thickness = float(normal_values.max() - normal_values.min() + 1.0)
+                slenderness = length / max(1.0, thickness)
+                # Exclude broad blobs, text clusters, and solid horizontal/vertical edges.
+                if length < 40.0 or thickness > 14.0 or slenderness < 5.0:
+                    continue
+
+                seen.add(key)
+                solid_components.append({
+                    "key": key,
+                    "box": {
+                        "x": key[0],
+                        "y": key[1],
+                        "width": bw,
+                        "height": bh,
+                        "component_area": area,
+                        "component_cx": x0 + float(centers[label][0]),
+                        "component_cy": y0 + float(centers[label][1]),
+                    },
+                    "direction": direction,
+                    "points": points,
+                    "along_min": float(along_values.min()),
+                    "along_max": float(along_values.max()),
+                })
+
+    # A long component can be attached to at most one dash train.
+    attached_keys: set[tuple[int, int, int, int]] = set()
+    for candidate in sorted(eligible, key=lambda item: (item["x1"], item["y1"])):
+        boxes = candidate["component_boxes"]
+        centers = np.asarray([
+            [
+                float(box.get("component_cx", box["x"] + box["width"] / 2)),
+                float(box.get("component_cy", box["y"] + box["height"] / 2)),
+            ]
+            for box in boxes
+        ], dtype=np.float32)
+        if len(centers) < 3:
+            continue
+
+        delta = centers[-1] - centers[0]
+        norm = float(np.linalg.norm(delta))
+        if norm < 1.0:
+            continue
+        direction = delta / norm
+        if direction[0] < 0:
+            direction = -direction
+        angle = abs(float(np.degrees(np.arctan2(direction[1], direction[0]))))
+        if not 25.0 <= angle <= 75.0:
+            continue
+
+        normal = np.asarray([-direction[1], direction[0]], dtype=np.float32)
+        projections = centers @ direction
+        normal_values = centers @ normal
+        axis_normal = float(np.median(normal_values))
+        # Approximate the dash extent, not just its centroid, to avoid joining overlaps.
+        chain_min = float(projections.min()) - 8.0
+        chain_max = float(projections.max()) + 8.0
+
+        for component in solid_components:
+            if component["key"] in attached_keys:
+                continue
+            if any(
+                (b["x"], b["y"], b["width"], b["height"]) == component["key"]
+                for b in boxes
+            ):
+                continue
+
+            solid_direction = component["direction"]
+            if abs(float(np.dot(direction, solid_direction))) < 0.9975:
+                continue
+
+            solid_normal = component["points"] @ normal
+            if abs(float(np.median(solid_normal)) - axis_normal) > 5.5:
+                continue
+
+            low, high = component["along_min"], component["along_max"]
+            if high < chain_min:
+                gap = chain_min - high
+            elif low > chain_max:
+                gap = low - chain_max
+            else:
+                # Overlapping projection could indicate a fused or crossing feature.
+                continue
+
+            if not 4.0 <= gap <= 110.0:
+                continue
+
+            boxes.append(component["box"])
+            attached_keys.add(component["key"])
+            candidate["attached_solid_component_count"] = (
+                int(candidate.get("attached_solid_component_count", 0)) + 1
+            )
+
+    return candidates
+
+
 def detect_dashed_guides(gray: np.ndarray, tile_size: int = 1024,
                          rgb: np.ndarray | None = None) -> list[dict]:
     h,w=gray.shape[:2]; found=[]; seen=set(); overlap=48; step=tile_size-overlap
@@ -334,6 +715,12 @@ def detect_dashed_guides(gray: np.ndarray, tile_size: int = 1024,
         confident=((len(starts)>=4 and gap_cv<=.55) or (len(starts)==3 and gap_cv<=.18 and length>=72)) and np.median(gaps)>=2 and np.median(dash_lengths)<=max(18,np.median(gaps)*1.5)
         projections.append({'x1':x1,'y1':y1,'x2':x2,'y2':y2,'kind':'periodic-line-review','classification':'high-confidence-removable' if confident else 'ambiguous-review','confidence':round(max(0,1-gap_cv),3),'dash_runs':int(len(starts)),'dash_gap_cv':round(gap_cv,3),'orientation':'horizontal' if abs(y2-y1)<=max(2,length*.04) else 'vertical' if abs(x2-x1)<=max(2,length*.04) else 'diagonal','detection_method':'aligned-hough-chain'})
     component_candidates = _component_dash_trains(gray, rgb=rgb, tile_size=tile_size)
+    compact_candidates = _compact_diagonal_dash_trains(
+        gray, rgb=rgb, tile_size=tile_size
+    )
+    compact_candidates = _attach_aligned_solid_components(
+        gray, compact_candidates, rgb=rgb, tile_size=tile_size
+    )
     # Avoid duplicate review records when an older detector already found the
     # same path. The component record still wins because it carries exact ink boxes.
     unique_components = []
@@ -347,7 +734,7 @@ def detect_dashed_guides(gray: np.ndarray, tile_size: int = 1024,
                 break
         if not duplicate:
             unique_components.append(candidate)
-    return projections + unique_components
+    return projections + unique_components + compact_candidates
 
 
 def build_guide_removal_mask(gray: np.ndarray, candidates: list[dict], rgb:np.ndarray|None=None,

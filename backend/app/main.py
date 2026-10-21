@@ -761,7 +761,7 @@ def finish_job_timing(jid):
 def _clean_candidate(jid, aid, path):
     try:
         source_stat=Path(path).stat()
-        detection_cache_key=f'{aid}:{source_stat.st_size}:{source_stat.st_mtime_ns}:detectors-v10'
+        detection_cache_key=f'{aid}:{source_stat.st_size}:{source_stat.st_mtime_ns}:detectors-v12'
         update_job(jid,status='processing')
         set_stage(jid,'loading',3,'Loading source image')
         rgb=read_rgb(path); gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)

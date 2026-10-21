@@ -52,6 +52,112 @@ class ShapeAnalysisTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(np.any(image[25:145,:,:]!=cleaned[25:145,:,:],axis=2)),100)
         self.assertTrue(classified[0]['mask_pixels']>0)
 
+
+    def test_compact_diagonal_dash_train_masks_only_observed_marks(self):
+        image = np.full((300, 440, 3), 255, np.uint8)
+        dash_boxes = [(40, 30), (54, 60), (68, 90), (82, 120), (96, 150)]
+        for index, (x, y) in enumerate(dash_boxes):
+            if index == len(dash_boxes) - 1:
+                # Include a compact mark that is only 7 pixels tall.
+                cv2.rectangle(image, (x, y + 1), (x + 9, y + 7), (0, 0, 0), -1)
+            else:
+                cv2.rectangle(image, (x, y), (x + 9, y + 9), (0, 0, 0), -1)
+
+        cv2.line(image, (12, 265), (428, 265), (0, 0, 0), 3)
+        cv2.putText(
+            image, "15", (230, 200), cv2.FONT_HERSHEY_SIMPLEX,
+            1.0, (0, 0, 0), 2, cv2.LINE_AA,
+        )
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        labels = np.zeros(gray.shape, np.uint8)
+        labels[170:212, 220:320] = 255
+
+        candidates = detect_dashed_guides(gray, tile_size=440, rgb=image)
+        train = next((item for item in candidates
+            if item.get("detection_method") == "collinear-connected-components"
+            and item.get("orientation") == "diagonal"
+            and item.get("dash_runs", 0) >= 4
+            and 30 <= item["x1"] <= 60
+            and 20 <= item["y1"] <= 50
+        ), None)
+        self.assertIsNotNone(train, candidates)
+        self.assertGreaterEqual(len(train.get("component_boxes", [])), 4)
+
+        mask, protected, classified = build_guide_removal_mask(gray, [train], image, labels)
+        combined_protection = cv2.bitwise_or(protected, labels)
+        cleaned = apply_removal_mask(image, mask, dilation=0, protected=combined_protection)
+
+        self.assertGreater(cv2.countNonZero(mask), 100)
+        self.assertTrue(np.array_equal(image[261:270, :], cleaned[261:270, :]), "solid parcel boundary changed")
+        self.assertTrue(np.array_equal(image[170:212, 220:320], cleaned[170:212, 220:320]), "principal label changed")
+        for x, y in dash_boxes:
+            changed = np.count_nonzero(np.any(image[y:y + 10, x:x + 10] != cleaned[y:y + 10, x:x + 10], axis=2))
+            self.assertGreater(changed, 40, f"dash at {(x, y)} was not removed")
+        self.assertGreater(classified[0]["mask_pixels"], 0)
+
+
+    def test_aligned_solid_stroke_is_attached_to_compact_diagonal_dash_train(self):
+        image = np.full((330, 460, 3), 255, np.uint8)
+
+        # An isolated thin solid stroke followed by five detached compact dashes.
+        cv2.line(image, (10, 10), (55, 105), (0, 0, 0), 3)
+        dash_boxes = [(60, 115), (74, 145), (88, 175), (102, 205), (116, 235)]
+        for x, y in dash_boxes:
+            cv2.rectangle(image, (x, y), (x + 9, y + 9), (0, 0, 0), -1)
+
+        # Unrelated boundary and protected label must remain byte-identical.
+        cv2.line(image, (12, 305), (448, 305), (0, 0, 0), 3)
+        cv2.putText(
+            image, "15", (252, 282), cv2.FONT_HERSHEY_SIMPLEX,
+            0.8, (0, 0, 0), 2, cv2.LINE_AA,
+        )
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        labels = np.zeros(gray.shape, np.uint8)
+        labels[252:289, 245:320] = 255
+
+        candidates = detect_dashed_guides(gray, tile_size=460, rgb=image)
+        train = next((item for item in candidates
+            if item.get("detection_method") == "collinear-connected-components"
+            and item.get("orientation") == "diagonal"
+            and item.get("dash_runs", 0) >= 4
+            and item.get("component_boxes")
+            and 45 <= item["x1"] <= 75
+            and 100 <= item["y1"] <= 135
+        ), None)
+        self.assertIsNotNone(train, candidates)
+        self.assertEqual(train.get("attached_solid_component_count"), 1, train)
+        self.assertEqual(len(train["component_boxes"]), 6, train["component_boxes"])
+
+        mask, protected, classified = build_guide_removal_mask(
+            gray, [train], image, labels
+        )
+        combined_protection = cv2.bitwise_or(protected, labels)
+        cleaned = apply_removal_mask(
+            image, mask, dilation=0, protected=combined_protection
+        )
+
+        self.assertGreater(cv2.countNonZero(mask), 250)
+        self.assertGreater(
+            np.count_nonzero(np.any(image[8:108, 8:60] != cleaned[8:108, 8:60], axis=2)),
+            100,
+            "aligned solid guide stroke was not removed",
+        )
+        for x, y in dash_boxes:
+            self.assertGreater(
+                np.count_nonzero(np.any(image[y:y + 10, x:x + 10] != cleaned[y:y + 10, x:x + 10], axis=2)),
+                40,
+                f"dash at {(x, y)} was not removed",
+            )
+        self.assertTrue(
+            np.array_equal(image[301:310, :], cleaned[301:310, :]),
+            "solid parcel boundary changed",
+        )
+        self.assertTrue(
+            np.array_equal(image[252:289, 245:320], cleaned[252:289, 245:320]),
+            "protected label changed",
+        )
+        self.assertGreater(classified[0]["mask_pixels"], 0)
+
     def test_real_manur_dash_crop_selects_guide_ink_and_preserves_boundary_and_plot_labels(self):
         fixture=Path(__file__).parent/'fixtures'/'manur-dash-top-crop.png'
         image=np.asarray(Image.open(fixture).convert('RGB'))
