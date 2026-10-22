@@ -736,6 +736,196 @@ def detect_dashed_guides(gray: np.ndarray, tile_size: int = 1024,
             unique_components.append(candidate)
     return projections + unique_components + compact_candidates
 
+def _bridge_confirmed_diagonal_guide_gaps(
+    gray: np.ndarray,
+    candidates: list[dict],
+    removal: np.ndarray,
+    protected: np.ndarray,
+    rgb: np.ndarray | None = None,
+    protected_labels: np.ndarray | None = None,
+) -> list[dict]:
+    """Mask only observed ink between collinear, confirmed diagonal guide groups.
+
+    Two independent compact-dash groups must each have an attached solid stroke,
+    similar directions, and a tightly aligned centerline. The bridge samples only
+    existing neutral-dark pixels in that corridor. Any cross-section with dark ink
+    outside the narrow guide band is kept review-only/protected around the crossing.
+    No line is rasterized across blank gaps.
+    """
+    eligible = [
+        item for item in candidates
+        if item.get("detection_method") == "collinear-connected-components"
+        and item.get("orientation") == "diagonal"
+        and item.get("classification") == "high-confidence-removable"
+        and int(item.get("attached_solid_component_count", 0)) >= 1
+        and len(item.get("component_boxes", [])) >= 3
+    ]
+    if len(eligible) < 2:
+        return []
+
+    h, w = gray.shape[:2]
+    if rgb is None:
+        dark = gray < 180
+    else:
+        channels = rgb.astype(np.int16)
+        chroma = channels.max(axis=2) - channels.min(axis=2)
+        dark = (gray < 180) & (chroma < 38)
+
+    axis_items = []
+    for index, item in enumerate(eligible):
+        p1 = np.asarray([float(item["x1"]), float(item["y1"])], np.float32)
+        p2 = np.asarray([float(item["x2"]), float(item["y2"])], np.float32)
+        vector = p2 - p1
+        norm = float(np.linalg.norm(vector))
+        if norm < 1.0:
+            continue
+        direction = vector / norm
+        if direction[0] < 0:
+            direction = -direction
+        angle = abs(float(np.degrees(np.arctan2(direction[1], direction[0]))))
+        if not 25.0 <= angle <= 75.0:
+            continue
+        axis_items.append({"source_index": index, "item": item, "p1": p1, "p2": p2, "direction": direction})
+
+    pairs = []
+    for i in range(len(axis_items)):
+        for j in range(i + 1, len(axis_items)):
+            a, b = axis_items[i], axis_items[j]
+            dot = float(np.dot(a["direction"], b["direction"]))
+            if dot < 0.995:
+                continue
+
+            direction = a["direction"] + b["direction"]
+            direction /= max(1e-6, float(np.linalg.norm(direction)))
+            if direction[0] < 0:
+                direction = -direction
+            normal = np.asarray([-direction[1], direction[0]], np.float32)
+
+            a_points = np.vstack((a["p1"], a["p2"]))
+            b_points = np.vstack((b["p1"], b["p2"]))
+            a_normal = float(np.median(a_points @ normal))
+            b_normal = float(np.median(b_points @ normal))
+            if abs(a_normal - b_normal) > 8.0:
+                continue
+
+            a_proj = a_points @ direction
+            b_proj = b_points @ direction
+            if float(np.mean(a_proj)) > float(np.mean(b_proj)):
+                a, b = b, a
+                a_points, b_points = b_points, a_points
+                a_proj, b_proj = b_proj, a_proj
+                a_normal, b_normal = b_normal, a_normal
+
+            gap = float(np.min(b_proj) - np.max(a_proj))
+            # A narrow, local continuation only; do not bridge across map regions.
+            if not 120.0 <= gap <= 650.0:
+                continue
+            pairs.append((gap, a, b, direction, normal, float(np.median([a_normal, b_normal]))))
+
+    records = []
+    used = set()
+    for gap, a, b, direction, normal, normal_ref in sorted(
+        pairs, key=lambda row: (row[0], row[1]["source_index"], row[2]["source_index"])
+    ):
+        key_a, key_b = a["source_index"], b["source_index"]
+        if key_a in used or key_b in used:
+            continue
+        used.update((key_a, key_b))
+
+        a_projection = np.asarray([a["p1"] @ direction, a["p2"] @ direction], np.float32)
+        b_projection = np.asarray([b["p1"] @ direction, b["p2"] @ direction], np.float32)
+        t_start = int(np.floor(float(a_projection.max()) + 2.0))
+        t_end = int(np.ceil(float(b_projection.min()) - 2.0))
+        if t_end - t_start < 100:
+            continue
+
+        t_values = np.arange(t_start, t_end + 1, dtype=np.float32)
+        offsets = np.arange(-24, 25, dtype=np.float32)
+        nx, ny = float(normal[0]), float(normal[1])
+        ux, uy = float(direction[0]), float(direction[1])
+
+        sx = np.rint(
+            ux * t_values[:, None] + nx * (normal_ref + offsets[None, :])
+        ).astype(np.int32)
+        sy = np.rint(
+            uy * t_values[:, None] + ny * (normal_ref + offsets[None, :])
+        ).astype(np.int32)
+        inside = (sx >= 0) & (sx < w) & (sy >= 0) & (sy < h)
+        support = np.zeros(sx.shape, dtype=bool)
+        support[inside] = dark[sy[inside], sx[inside]]
+
+        center_band = np.abs(offsets) <= 5
+        outer_band = (np.abs(offsets) >= 8) & (np.abs(offsets) <= 24)
+        center_ink = support[:, center_band].any(axis=1)
+        outer_ink = support[:, outer_band].any(axis=1)
+        occupancy = float(np.count_nonzero(center_ink)) / max(1, len(center_ink))
+        transitions = np.diff(np.r_[False, center_ink, False].astype(np.int8))
+        run_starts = np.flatnonzero(transitions == 1)
+        run_ends = np.flatnonzero(transitions == -1)
+        longest_run = int(np.max(run_ends - run_starts)) if len(run_starts) else 0
+
+        # There must be actual line-like evidence in the middle, not just the
+        # two endpoint groups or a single crossing boundary.
+        if occupancy < 0.16 or longest_run < 24:
+            continue
+
+        # A dark stroke in the outer band signals a crossing or nearby boundary.
+        # Protect a 13-pixel longitudinal neighborhood around each such crossing.
+        crossing_kernel = np.ones((1, 13), np.uint8)
+        protected_t = cv2.dilate(
+            outer_ink.astype(np.uint8)[None, :], crossing_kernel, iterations=1
+        )[0] > 0
+
+        selected = support & center_band[None, :] & (~protected_t[:, None]) & inside
+        rr, cc = np.where(selected)
+        px, py = sx[rr, cc], sy[rr, cc]
+        if protected_labels is not None and len(px):
+            keep = protected_labels[py, px] == 0
+            px, py = px[keep], py[keep]
+        if len(px):
+            keep = protected[py, px] == 0
+            px, py = px[keep], py[keep]
+
+        # Also avoid overwriting colored or previously protected annotation pixels.
+        if len(px):
+            removal[py, px] = 255
+
+        preserved = support & protected_t[:, None] & inside
+        pr, pc = np.where(preserved)
+        protected_pixels_x = sx[pr, pc]
+        protected_pixels_y = sy[pr, pc]
+        if len(protected_pixels_x):
+            protected[protected_pixels_y, protected_pixels_x] = 255
+
+        mask_pixels = int(len(np.unique(py.astype(np.int64) * w + px))) if len(px) else 0
+        crossing_pixels = (
+            int(len(np.unique(protected_pixels_y.astype(np.int64) * w + protected_pixels_x)))
+            if len(protected_pixels_x) else 0
+        )
+        if mask_pixels == 0 and crossing_pixels == 0:
+            continue
+
+        records.append({
+            "x1": int(round(float(ux * t_start + nx * normal_ref))),
+            "y1": int(round(float(uy * t_start + ny * normal_ref))),
+            "x2": int(round(float(ux * t_end + nx * normal_ref))),
+            "y2": int(round(float(uy * t_end + ny * normal_ref))),
+            "kind": "guide-continuation-review",
+            "classification": "ambiguous-review" if crossing_pixels else "high-confidence-removable",
+            "confidence": round(min(1.0, occupancy), 3),
+            "dash_runs": int(len(run_starts)),
+            "dash_gap_cv": None,
+            "orientation": "diagonal",
+            "detection_method": "pixelwise-collinear-continuation",
+            "component_boxes": [],
+            "mask_pixels": mask_pixels,
+            "protected_boundary_pixels": crossing_pixels,
+            "review_required": bool(crossing_pixels),
+            "review_reason": "crossing or nearby boundary pixels protected" if crossing_pixels else None,
+        })
+
+    return records
+
 
 def build_guide_removal_mask(gray: np.ndarray, candidates: list[dict], rgb:np.ndarray|None=None,
                              protected_labels: np.ndarray|None=None) -> tuple[np.ndarray,np.ndarray,list[dict]]:
@@ -896,6 +1086,10 @@ def build_guide_removal_mask(gray: np.ndarray, candidates: list[dict], rgb:np.nd
         candidate['review_reason']='guide crosses or approaches protected boundary pixels' if candidate['review_required'] else None
         candidate['classification']='ambiguous-review' if candidate['review_required'] or not candidate['mask_pixels'] else 'high-confidence-removable'
         classified.append(candidate)
+    bridge_records = _bridge_confirmed_diagonal_guide_gaps(
+        gray, candidates, removal, protected, rgb=rgb, protected_labels=protected_labels
+    )
+    classified.extend(bridge_records)
     return removal,protected,classified
 
 

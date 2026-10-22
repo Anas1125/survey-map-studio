@@ -158,6 +158,84 @@ class ShapeAnalysisTests(unittest.TestCase):
         )
         self.assertGreater(classified[0]["mask_pixels"], 0)
 
+
+    def test_pixelwise_continuation_removes_safe_middle_and_protects_crossing(self):
+        image = np.full((410, 390, 3), 255, np.uint8)
+        ux, uy = 0.4472136, 0.8944272
+
+        def point(t):
+            return (int(round(40 + ux * t)), int(round(20 + uy * t)))
+
+        def dash_box(t):
+            cx, cy = point(t)
+            cv2.rectangle(image, (cx - 4, cy - 4), (cx + 4, cy + 4), (0, 0, 0), -1)
+            return {
+                "x": cx - 4, "y": cy - 4, "width": 9, "height": 9,
+                "component_area": 81, "component_cx": cx, "component_cy": cy,
+            }
+
+        a_boxes = [dash_box(t) for t in (50, 75, 100)]
+        b_boxes = [dash_box(t) for t in (310, 335, 360)]
+
+        # The actual dark continuation between the groups.
+        cv2.line(image, point(120), point(300), (0, 0, 0), 3)
+        # A crossing parcel boundary must stay byte-identical.
+        cv2.line(image, (8, 210), (382, 210), (0, 0, 0), 3)
+        # Simulate a protected measurement-label area near the guide.
+        cv2.putText(image, "6", (142, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        labels = np.zeros(gray.shape, np.uint8)
+        labels[229:263, 135:174] = 255
+
+        def candidate(boxes):
+            first, last = boxes[0], boxes[-1]
+            return {
+                "x1": int(first["component_cx"]),
+                "y1": int(first["component_cy"]),
+                "x2": int(last["component_cx"]),
+                "y2": int(last["component_cy"]),
+                "kind": "connected-component-dash-train",
+                "classification": "high-confidence-removable",
+                "confidence": 0.99,
+                "dash_runs": len(boxes),
+                "dash_gap_cv": 0.01,
+                "orientation": "diagonal",
+                "detection_method": "collinear-connected-components",
+                "component_boxes": boxes,
+                "attached_solid_component_count": 1,
+                "review_required": False,
+            }
+
+        candidates = [candidate(a_boxes), candidate(b_boxes)]
+        mask, protected, classified = build_guide_removal_mask(
+            gray, candidates, image, protected_labels=labels
+        )
+        cleaned = apply_removal_mask(image, mask, dilation=0, protected=protected)
+        cleaned[protected > 0] = image[protected > 0]
+        cleaned[labels > 0] = image[labels > 0]
+
+        bridges = [
+            item for item in classified
+            if item.get("detection_method") == "pixelwise-collinear-continuation"
+        ]
+        self.assertEqual(len(bridges), 1, classified)
+        self.assertGreater(bridges[0]["mask_pixels"], 0, bridges[0])
+        self.assertGreater(bridges[0]["protected_boundary_pixels"], 0, bridges[0])
+        self.assertGreater(
+            np.count_nonzero(np.any(image[130:180, 90:120] != cleaned[130:180, 90:120], axis=2)),
+            10,
+            "middle guide continuation was not removed",
+        )
+        self.assertTrue(
+            np.array_equal(image[207:214, :], cleaned[207:214, :]),
+            "crossing parcel boundary changed",
+        )
+        self.assertTrue(
+            np.array_equal(image[labels > 0], cleaned[labels > 0]),
+            "protected measurement-label region changed",
+        )
+
     def test_real_manur_dash_crop_selects_guide_ink_and_preserves_boundary_and_plot_labels(self):
         fixture=Path(__file__).parent/'fixtures'/'manur-dash-top-crop.png'
         image=np.asarray(Image.open(fixture).convert('RGB'))

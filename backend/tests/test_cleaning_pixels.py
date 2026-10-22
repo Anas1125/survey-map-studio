@@ -6,7 +6,7 @@ import numpy as np
 import uuid
 from fastapi import BackgroundTasks, HTTPException
 
-from app.main import apply_removal_mask, build_principal_label_mask, build_red_ink_mask, is_principal_integer, exclude_protected_pixels, _has_decimal_component_signature, map_ocr_box, detect_merged_measurement_labels, detect_color_measurements, detect_oriented_measurements, _ocr_small_region, _write_detection_cache, _cache_path, assets, jobs, PROCESSED_DIR, ORIGINALS_DIR, THUMB_DIR, MANUAL_EDITS_DIR, JOBS_DIR, persist_job, normalize_asset_record, public_asset, list_maps, delete_map, thumbnail, map_preview, job_preview, export_png, approve, edit_candidate, save_manual_edits, get_manual_edits, Approval, process_map, _removal_has_evidence, _is_decimal_ocr_alias
+from app.main import apply_removal_mask, build_principal_label_mask, build_red_ink_mask, is_principal_integer, is_protected_principal_detection, exclude_protected_pixels, _has_decimal_component_signature, map_ocr_box, detect_merged_measurement_labels, detect_color_measurements, detect_oriented_measurements, _ocr_small_region, _write_detection_cache, _cache_path, assets, jobs, PROCESSED_DIR, ORIGINALS_DIR, THUMB_DIR, MANUAL_EDITS_DIR, JOBS_DIR, persist_job, normalize_asset_record, public_asset, list_maps, delete_map, thumbnail, map_preview, job_preview, export_png, approve, edit_candidate, save_manual_edits, get_manual_edits, Approval, process_map, _removal_has_evidence, _is_decimal_ocr_alias
 from app.manual_edits import display_to_source_point
 
 
@@ -24,6 +24,99 @@ class CleaningPixelTests(unittest.TestCase):
         red_mask=build_red_ink_mask(image)
         self.assertEqual(cv2.countNonZero(cv2.bitwise_and(red_mask,protected)),0)
         self.assertGreater(cv2.countNonZero(protected),0)
+
+
+    def test_alphanumeric_plot_ids_are_protected(self):
+        image = np.full((120, 260, 3), 255, np.uint8)
+        origin = (20, 78)
+        color = (30, 70, 220)
+
+        cv2.putText(
+            image, "13B1", origin, cv2.FONT_HERSHEY_SIMPLEX,
+            0.9, color, 2, cv2.LINE_AA,
+        )
+
+        (text_w, text_h), baseline = cv2.getTextSize(
+            "13B1", cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2
+        )
+        box = {
+            "text": "13B1",
+            "x": origin[0] - 3,
+            "y": origin[1] - text_h - 3,
+            "width": text_w + 6,
+            "height": text_h + baseline + 6,
+            "kind": "principal-label",
+        }
+
+        self.assertTrue(is_principal_integer(image, box))
+
+        protected = build_principal_label_mask(
+            image.shape[:2], [box], [], padding=1, rgb=image
+        )
+
+        x, y, w, h = (box[k] for k in ("x", "y", "width", "height"))
+        roi = image[y:y+h, x:x+w]
+        chroma = (
+            roi.max(axis=2).astype(np.int16)
+            - roi.min(axis=2).astype(np.int16)
+        )
+        colored_ink = chroma >= 30
+
+        self.assertGreater(int(colored_ink.sum()), 0)
+        self.assertTrue(
+            np.all(protected[y:y+h, x:x+w][colored_ink] > 0),
+            "alphanumeric plot label was not protected",
+        )
+
+        removal = np.zeros(image.shape[:2], np.uint8)
+        cv2.rectangle(removal, (x, y), (x+w-1, y+h-1), 255, -1)
+        cleaned = apply_removal_mask(
+            image, removal, dilation=2, protected=protected
+        )
+
+        self.assertTrue(
+            np.array_equal(
+                roi[colored_ink],
+                cleaned[y:y+h, x:x+w][colored_ink],
+            ),
+            "plot ID ink changed during removal",
+        )
+
+    def test_blue_plot_number_survives_decimal_alias_filter(self):
+        import numpy as np
+
+        rgb = np.full((80, 120, 3), 255, dtype=np.uint8)
+
+        label_box = {
+            "text": "8",
+            "x": 20,
+            "y": 15,
+            "width": 30,
+            "height": 40,
+            "confidence": 95,
+            "detection_method": "blue-component-integer-ocr",
+        }
+
+        decimal_box = {
+            "text": "8.8",
+            "x": 20,
+            "y": 15,
+            "width": 30,
+            "height": 40,
+            "confidence": 95,
+        }
+
+        # A blue numeric detection overlapping a decimal must not be
+        # protected as a standalone plot number.
+        assert not is_protected_principal_detection(
+            rgb, label_box, [decimal_box]
+        )
+
+        # A numeric label without a matching decimal remains eligible
+        # for protection.
+        assert is_protected_principal_detection(
+            rgb, label_box, []
+        )
 
     def test_red_mask_selects_annotation_ink_without_nearby_black_boundary(self):
         image=np.full((100,180,3),255,np.uint8)

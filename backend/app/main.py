@@ -176,6 +176,15 @@ def apply_removal_mask(rgb:np.ndarray, mask:np.ndarray, *, dilation:int=2, prote
     if protected is not None: result[protected>0]=rgb[protected>0]
     return result
 
+
+def _is_principal_label_text(text: object) -> bool:
+    value = str(text or "").strip()
+    return bool(re.fullmatch(
+        r"(?:\d{1,4}|\d{1,3}[A-Za-z]{1,2}\d{1,2})",
+        value,
+        re.IGNORECASE,
+    ))
+
 def build_principal_label_mask(shape, detections:list[dict], merged_labels:list[dict], padding:int=2,
                                rgb:np.ndarray|None=None, competing_boxes:list[dict]|None=None)->np.ndarray:
     """Protect OCR-confirmed standalone integer labels and integers paired with decimals.
@@ -185,7 +194,8 @@ def build_principal_label_mask(shape, detections:list[dict], merged_labels:list[
     """
     height,width=shape[:2]; protected=np.zeros((height,width),np.uint8); boxes=[]
     for item in detections:
-        if re.fullmatch(r'\d{1,4}',str(item.get('text','')).strip()): boxes.append(item)
+        if _is_principal_label_text(item.get('text', '')):
+            boxes.append(item)
     boxes.extend(item['protected_box'] for item in merged_labels if isinstance(item.get('protected_box'),dict))
     for box in boxes:
         x,y,w,h=[int(box.get(k,0)) for k in ('x','y','width','height')]
@@ -240,7 +250,10 @@ def _red_ink_fraction(rgb:np.ndarray, box:dict)->float:
     return float(cv2.countNonZero(red))/max(1,(x1-x0)*(y1-y0))
 
 def is_principal_integer(rgb:np.ndarray, box:dict)->bool:
-    return bool(re.fullmatch(r'\d{1,4}',str(box.get('text','')).strip()) and _red_ink_fraction(rgb,box)<.12)
+    return bool(
+        _is_principal_label_text(box.get('text', ''))
+        and _red_ink_fraction(rgb, box) < .12
+    )
 
 def _is_decimal_ocr_alias(integer_box: dict, decimal_boxes: list[dict]) -> bool:
     """Ignore a weak integer OCR reading that duplicates a decimal's same glyph region."""
@@ -286,6 +299,16 @@ def _is_decimal_ocr_alias(integer_box: dict, decimal_boxes: list[dict]) -> bool:
             return True
 
     return False
+
+def is_protected_principal_detection(
+    rgb: np.ndarray, box: dict, decimal_boxes: list[dict]
+) -> bool:
+    if not is_principal_integer(rgb, box):
+        return False
+
+    # Never protect a numeric detection that duplicates a decimal measurement.
+    # This rule applies to blue-component detections as well as ordinary OCR.
+    return not _is_decimal_ocr_alias(box, decimal_boxes)
 
 def build_red_ink_mask(rgb:np.ndarray)->np.ndarray:
     hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
@@ -363,18 +386,194 @@ def _has_decimal_component_signature(components:list[tuple])->bool:
         if left and right: return True
     return False
 
-def _ocr_blue_integer_crop(rgb:np.ndarray)->tuple[str,float]:
-    """Read blue parcel-number glyphs while suppressing black parcel lines below them."""
+def _ocr_blue_integer_crop(rgb: np.ndarray) -> tuple[str, float]:
+    """Read blue parcel-number glyphs with multiple OCR segmentation modes."""
     import pytesseract
-    hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
-    blue=cv2.inRange(hsv,np.array([82,38,32],np.uint8),np.array([153,255,255],np.uint8))
-    if cv2.countNonZero(blue)<5: return '',-1.0
-    isolated=np.where(blue>0,0,255).astype(np.uint8)
-    padded=cv2.copyMakeBorder(isolated,12,12,12,12,cv2.BORDER_CONSTANT,value=255)
-    enlarged=cv2.resize(padded,None,fx=3,fy=3,interpolation=cv2.INTER_NEAREST)
-    data=pytesseract.image_to_data(enlarged,output_type=pytesseract.Output.DICT,config='--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789')
-    tokens=[(str(text).strip(),float(data['conf'][i])) for i,text in enumerate(data['text']) if str(text).strip()]
-    return ''.join(text for text,_ in tokens),max((confidence for _,confidence in tokens),default=-1.0)
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    blue = cv2.inRange(
+        hsv,
+        np.array([82, 38, 32], np.uint8),
+        np.array([153, 255, 255], np.uint8),
+    )
+    if cv2.countNonZero(blue) < 5:
+        return "", -1.0
+
+    isolated = np.where(blue > 0, 0, 255).astype(np.uint8)
+    padded = cv2.copyMakeBorder(
+        isolated, 12, 12, 12, 12,
+        cv2.BORDER_CONSTANT, value=255,
+    )
+    enlarged = cv2.resize(
+        padded, None, fx=3, fy=3,
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+    for psm in (7, 10, 13):
+        data = pytesseract.image_to_data(
+            enlarged,
+            output_type=pytesseract.Output.DICT,
+            config=(
+                f"--oem 1 --psm {psm} "
+                "-c tessedit_char_whitelist=0123456789"
+            ),
+        )
+        tokens = [
+            (
+                str(text).strip(),
+                float(data["conf"][i]),
+            )
+            for i, text in enumerate(data["text"])
+            if str(text).strip()
+        ]
+        text = "".join(token for token, _ in tokens)
+        confidence = max(
+            (conf for _, conf in tokens),
+            default=-1.0,
+        )
+
+        if re.fullmatch(r"\d{1,4}", text):
+            return text, confidence
+
+    return "", -1.0
+
+def _looks_like_underlined_label(components: list[tuple]) -> bool:
+    """Identify a compact glyph group with a separate underline."""
+    if len(components) < 2:
+        return False
+
+    max_height = max(c[3] for c in components)
+    if max_height < 8:
+        return False
+
+    glyphs = [
+        c for c in components
+        if c[3] >= max(5, max_height * 0.35)
+    ]
+    if not glyphs:
+        return False
+
+    gx0 = min(c[0] for c in glyphs)
+    gx1 = max(c[0] + c[2] for c in glyphs)
+    gy1 = max(c[1] + c[3] for c in glyphs)
+    glyph_height = float(np.median([c[3] for c in glyphs]))
+    glyph_width = gx1 - gx0
+
+    for component in components:
+        if component in glyphs:
+            continue
+
+        x, y, w, h, _ = component
+
+        is_thin = h <= max(2, glyph_height * 0.14)
+        is_wide = w >= max(5, glyph_height * 0.30)
+        is_below = (
+            gy1 - glyph_height * 0.12
+            <= y
+            <= gy1 + glyph_height * 0.35
+        )
+
+        overlap = max(0, min(gx1, x + w) - max(gx0, x))
+        spans_glyph = overlap >= 0.45 * min(w, max(1, glyph_width))
+
+        if is_thin and is_wide and is_below and spans_glyph:
+            return True
+
+    return False
+
+
+def _ocr_black_integer_crop(rgb: np.ndarray) -> tuple[str, float]:
+    """Read black plot numbers while suppressing blue/red ink and ruling lines."""
+    import pytesseract
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    blue = cv2.inRange(
+        hsv,
+        np.array([82, 38, 32], np.uint8),
+        np.array([153, 255, 255], np.uint8),
+    )
+    red = cv2.bitwise_or(
+        cv2.inRange(
+            hsv,
+            np.array([0, 30, 45], np.uint8),
+            np.array([16, 255, 255], np.uint8),
+        ),
+        cv2.inRange(
+            hsv,
+            np.array([164, 30, 45], np.uint8),
+            np.array([179, 255, 255], np.uint8),
+        ),
+    )
+
+    black = cv2.inRange(gray, 0, 145)
+    black[blue > 0] = 0
+    black[red > 0] = 0
+
+    count, component_map, stats, _ = cv2.connectedComponentsWithStats(
+        black, 8
+    )
+    cleaned = np.zeros_like(black)
+
+    for i in range(1, count):
+        x, y, w, h, _ = map(int, stats[i])
+
+        # Remove thin ruling lines and long, narrow parcel boundaries.
+        horizontal_line = (
+            h <= max(2, int(rgb.shape[0] * 0.06))
+            and w >= max(6, int(rgb.shape[0] * 0.25))
+        )
+        vertical_line = (
+            w <= max(2, int(rgb.shape[1] * 0.06))
+            and h >= max(8, int(rgb.shape[0] * 0.35))
+        )
+
+        if horizontal_line or vertical_line:
+            continue
+
+        cleaned[component_map == i] = 255
+
+    if cv2.countNonZero(cleaned) < 5:
+        return "", -1.0
+
+    isolated = np.where(cleaned > 0, 0, 255).astype(np.uint8)
+    padded = cv2.copyMakeBorder(
+        isolated, 12, 12, 12, 12,
+        cv2.BORDER_CONSTANT, value=255,
+    )
+    enlarged = cv2.resize(
+        padded, None, fx=3, fy=3,
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+    for psm in (7, 10, 13):
+        data = pytesseract.image_to_data(
+            enlarged,
+            output_type=pytesseract.Output.DICT,
+            config=(
+                f"--oem 1 --psm {psm} "
+                "-c tessedit_char_whitelist=0123456789"
+            ),
+        )
+        tokens = [
+            (
+                str(text).strip(),
+                float(data["conf"][i]),
+            )
+            for i, text in enumerate(data["text"])
+            if str(text).strip()
+        ]
+        text = "".join(token for token, _ in tokens)
+        confidence = max(
+            (conf for _, conf in tokens),
+            default=-1.0,
+        )
+
+        if re.fullmatch(r"\d{1,4}", text):
+            return text, confidence
+
+    return "", -1.0
 
 def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|None=None,include_labels:bool=False):
     """Propose decimal text lines from blue or black ink components, then validate with Tesseract.
@@ -465,7 +664,25 @@ def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|
                         if not decimal_signature:
                             # A crop-level pass recovers small blue parcel IDs omitted
                             # by sparse page OCR. It only protects OCR-confirmed integers.
-                            if not include_labels or ink!='blue' or not (8<=by1-by0<=120 and bx1-bx0<=max(30,(by1-by0)*2.5) and len(g)<=4): continue
+                            is_label_ink = (
+                                ink == "blue"
+                                or (
+                                    ink == "black"
+                                    and rotation == 0
+                                    and _looks_like_underlined_label(g)
+                                )
+                            )
+
+                            if (
+                                not include_labels
+                                or not is_label_ink
+                                or not (
+                                    8 <= by1 - by0 <= 120
+                                    and bx1 - bx0 <= max(30, (by1 - by0) * 2.5)
+                                    and len(g) <= 4
+                                )
+                            ):
+                                continue
                             rx,ry,rw,rh=map_ocr_box(bx0,by0,bx1-bx0,by1-by0,rotation,tile.shape[1],tile.shape[0]); rx+=x0; ry+=y0
                             label_key=(rx//4,ry//4,rw//4,rh//4)
                             crop=view[
@@ -473,13 +690,19 @@ def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|
                                 max(0,bx0-8):min(view.shape[1],bx1+8)
                             ]
 
+                            label_runner = (
+                                _ocr_blue_integer_crop
+                                if ink == "blue"
+                                else _ocr_black_integer_crop
+                            )
+
                             enqueue_ocr(
-                                'label',
+                                "label",
                                 label_key,
-                                _ocr_blue_integer_crop,
+                                label_runner,
                                 crop,
-                                (rx,ry,rw,rh),
-                                ink
+                                (rx, ry, rw, rh),
+                                ink,
                             )
                             continue
                         rx,ry,rw,rh=map_ocr_box(bx0,by0,bx1-bx0,by1-by0,rotation,tile.shape[1],tile.shape[0])
@@ -503,7 +726,7 @@ def detect_color_measurements(rgb:np.ndarray,tile_size:int=2048,*,cache_key:str|
             if region_key in seen_label_regions: continue
             label_text,label_conf=result
             seen_label_regions.add(region_key)
-            labels_found.append({'text':label_text,'x':rx,'y':ry,'width':rw,'height':rh,'confidence':label_conf,'kind':'principal-label','color':ink,'detection_method':'blue-component-integer-ocr'})
+            labels_found.append({'text':label_text,'x':rx,'y':ry,'width':rw,'height':rh,'confidence':label_conf,'kind':'principal-label','color':ink,'detection_method': f'{ink}-component-integer-ocr'})
             continue
         if region_key in seen_regions: continue
         text,conf=result
@@ -761,7 +984,7 @@ def finish_job_timing(jid):
 def _clean_candidate(jid, aid, path):
     try:
         source_stat=Path(path).stat()
-        detection_cache_key=f'{aid}:{source_stat.st_size}:{source_stat.st_mtime_ns}:detectors-v12'
+        detection_cache_key=f'{aid}:{source_stat.st_size}:{source_stat.st_mtime_ns}:detectors-v15'
         update_job(jid,status='processing')
         set_stage(jid,'loading',3,'Loading source image')
         rgb=read_rgb(path); gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
@@ -859,16 +1082,25 @@ def _clean_candidate(jid, aid, path):
                 if 8<=length<=45: dashed.append({'x1':x1,'y1':y1,'x2':x2,'y2':y2,'confidence':'review'})
         set_stage(jid,'mask_creation',62,'Creating full-resolution removal masks')
         protected_boxes=[b['protected_box'] for b in merged_labels if isinstance(b.get('protected_box'),dict)]
+        decimal_sources = (
+            detected
+            + removable
+            + uncertain
+            + color_measurements
+            + merged_labels
+        )
+
         decimal_boxes = [
-            b for b in removable
-            if re.search(r"\d\s*[.,]\s*\d", str(b.get("text", "")))
-            and float(b.get("confidence", 0) or 0) >= 85
+            b for b in decimal_sources
+            if re.search(
+                r"\d\s*[.,]\s*\d",
+                str(b.get("text", "")),
+            )
         ]
 
         integer_detections = [
             b for b in detected
-            if is_principal_integer(rgb, b)
-            and not _is_decimal_ocr_alias(b, decimal_boxes)
+            if is_protected_principal_detection(rgb, b, decimal_boxes)
         ]
         principal_boxes=[]
         principal_boxes.extend(integer_detections)
